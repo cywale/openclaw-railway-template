@@ -11,6 +11,11 @@ RUN apt-get update \
     build-essential \
   && rm -rf /var/lib/apt/lists/*
 
+# Install cloudflared for Cloudflare Tunnel
+RUN curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+  && dpkg -i cloudflared.deb \
+  && rm cloudflared.deb
+
 RUN npm install -g openclaw@latest
 
 WORKDIR /app

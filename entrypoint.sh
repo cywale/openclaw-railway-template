@@ -11,4 +11,7 @@ fi
 rm -rf /home/linuxbrew/.linuxbrew
 ln -sfn /data/.linuxbrew /home/linuxbrew/.linuxbrew
 
+# Start cloudflared in the background
+cloudflared tunnel --no-autoupdate run --token $CLOUDFLARE_TUNNEL_TOKEN &
+
 exec gosu openclaw node src/server.js
