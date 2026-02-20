@@ -9,6 +9,11 @@ import httpProxy from "http-proxy";
 import pty from "node-pty";
 import { WebSocketServer } from "ws";
 
+// Prevent unhandled rejections from crashing the process silently
+process.on("unhandledRejection", (err) => {
+  console.error("[wrapper] unhandled rejection:", err);
+});
+
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
@@ -114,19 +119,25 @@ function sleep(ms) {
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
-  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
+  const endpoints = ["/openclaw", "/", "/health"];
 
   while (Date.now() - start < timeoutMs) {
     for (const endpoint of endpoints) {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 3000);
       try {
         const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
           method: "GET",
+          signal: ac.signal,
         });
+        clearTimeout(timer);
         if (res) {
           console.log(`[gateway] ready at ${endpoint}`);
           return true;
         }
       } catch (err) {
+        clearTimeout(timer);
+        if (err.name === "AbortError") continue; // fetch timed out, retry
         if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
           const msg = err.code || err.message;
           if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
@@ -148,9 +159,25 @@ async function startGateway() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
+  // Skip OpenClaw's built-in gateway lock entirely — we manage the single
+  // gateway process ourselves via gatewayProc.  This avoids stale lock files
+  // left on the persistent volume from a previous container causing an
+  // infinite "gateway already running" restart loop.
+  process.env.OPENCLAW_ALLOW_MULTI_GATEWAY = "1";
+
+  // Kill any leftover gateway processes before starting
+  try {
+    childProcess.execSync("pkill -f 'openclaw.*gateway' 2>/dev/null || true", { timeout: 5000 });
+  } catch {}
+
+  // Clean up ALL possible lock file locations (belt-and-suspenders).
+  // OpenClaw stores locks in /tmp/openclaw-<uid>/gateway.<hash>.lock
+  try {
+    childProcess.execSync("rm -rf /tmp/openclaw-*/gateway.*.lock 2>/dev/null || true", { timeout: 5000 });
+  } catch {}
   for (const lockPath of [
     path.join(STATE_DIR, "gateway.lock"),
-    "/tmp/openclaw-gateway.lock",
+    path.join(STATE_DIR, "gateway.pid"),
   ]) {
     try {
       fs.rmSync(lockPath, { force: true });
@@ -991,8 +1018,20 @@ app.use(async (req, res) => {
     }
   }
 
-  if (req.path === "/openclaw" && !req.query.token) {
-    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
+  // Inject gateway token into any Control UI page so the JS client can
+  // authenticate its WebSocket "connect" message.  The Control UI reads
+  // the token from either ?token= or #token= on first load, then stores
+  // it in localStorage for subsequent visits.  We redirect once so the
+  // browser's URL contains the token fragment.
+  const gatewayPages = ["/openclaw", "/cron", "/control"];
+  if (
+    !req.query.token &&
+    (gatewayPages.includes(req.path) || gatewayPages.some((p) => req.path.startsWith(p + "/")))
+  ) {
+    // Use hash fragment (#token=) so the token doesn't get sent to CDNs or
+    // logged in access logs on intermediate proxies.
+    const sep = req.url.includes("?") ? "&" : "?";
+    return res.redirect(`${req.url}${sep}token=${OPENCLAW_GATEWAY_TOKEN}`);
   }
 
   return proxy.web(req, res, { target: GATEWAY_TARGET });
@@ -1020,6 +1059,20 @@ const server = app.listen(PORT, () => {
     });
   }
 });
+
+// Periodic disk cleanup every 6 hours to prevent ENOSPC
+setInterval(() => {
+  try {
+    // Clear Chrome cache
+    childProcess.execSync('rm -rf /data/.openclaw/browser/*/Cache /data/.openclaw/browser/*/Code\\ Cache /data/.openclaw/browser/*/GPUCache 2>/dev/null || true', { timeout: 10000 });
+    // Clear radio temp files
+    childProcess.execSync('rm -rf /tmp/radio/* 2>/dev/null || true', { timeout: 5000 });
+    const df = childProcess.execSync('df -h /data 2>/dev/null || true', { timeout: 5000 }).toString().trim();
+    console.log(`[cleanup] periodic disk cleanup done. ${df.split("\n").pop()}`);
+  } catch (err) {
+    console.warn(`[cleanup] failed: ${err.message}`);
+  }
+}, 6 * 60 * 60 * 1000);
 
 const tuiWss = createTuiWebSocketServer(server);
 
@@ -1061,6 +1114,14 @@ server.on("upgrade", async (req, socket, head) => {
     console.warn(`[websocket] gateway not ready: ${err.message}`);
     socket.destroy();
     return;
+  }
+  // Inject gateway token into the URL so OpenClaw accepts the WebSocket.
+  // The proxyReqWs header injection alone isn't enough — newer OpenClaw
+  // versions check the URL query parameter for WebSocket auth.
+  const wsUrl = new URL(req.url, `http://${req.headers.host}`);
+  if (!wsUrl.searchParams.has("token")) {
+    wsUrl.searchParams.set("token", OPENCLAW_GATEWAY_TOKEN);
+    req.url = wsUrl.pathname + wsUrl.search;
   }
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
