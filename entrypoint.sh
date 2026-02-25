@@ -24,7 +24,7 @@ rm -f /data/.openclaw/gateway.lock /data/.openclaw/gateway.pid 2>/dev/null || tr
 pkill -f 'openclaw.*gateway' 2>/dev/null || true
 
 # Clear old config backups
-find /data/.openclaw -name "*.bak" -o -name "*.bak.*" | head -20 | xargs rm -f 2>/dev/null || true
+find /data/.openclaw -name "*.bak" -o -name "*.bak.*" 2>/dev/null | head -20 | xargs rm -f 2>/dev/null || true
 
 # Clear openclaw update/cache dirs
 rm -rf /data/.openclaw/cache 2>/dev/null || true
