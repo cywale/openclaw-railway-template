@@ -10,6 +10,8 @@ RUN apt-get update \
     procps \
     python3 \
     build-essential \
+    zip \
+    micro \
     # Chrome/Playwright dependencies
     libnss3 \
     libnspr4 \

@@ -660,6 +660,18 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
       );
       extra += `[config] gateway.controlUi.allowInsecureAuth=true exit=${allowInsecureResult.code}\n`;
 
+      const allowedOriginsResult = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "--json",
+          "gateway.controlUi.allowedOrigins",
+          '["*"]',
+        ]),
+      );
+      extra += `[config] gateway.controlUi.allowedOrigins=["*"] exit=${allowedOriginsResult.code}\n`;
+
       const tokenResult = await runCmd(
         OPENCLAW_NODE,
         clawArgs([
@@ -967,6 +979,7 @@ const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
   xfwd: true,
+  changeOrigin: true,
   proxyTimeout: 120_000,
   timeout: 120_000,
 });
@@ -989,10 +1002,12 @@ proxy.on("error", (err, _req, res) => {
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  proxyReq.setHeader("Origin", GATEWAY_TARGET);
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
   proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  proxyReq.setHeader("Origin", GATEWAY_TARGET);
 });
 
 app.use(async (req, res) => {
