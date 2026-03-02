@@ -941,7 +941,7 @@ app.post(
       }
       const entries = listResult.stdout.split("\n").filter(Boolean);
       const dangerous = entries.filter(
-        (e) => e.includes("..") || path.isAbsolute("/" + e.replace(/^\//, "")),
+        (e) => e.includes("..") || e.startsWith("/"),
       );
       if (dangerous.length > 0) {
         return res.status(400).json({
