@@ -108,9 +108,19 @@ function isConfigured() {
   }
 }
 
+function getConfiguredAt() {
+  try {
+    const stat = fs.statSync(configPath());
+    return stat.mtime.toISOString();
+  } catch {
+    return null;
+  }
+}
+
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
+let lastGatewayError = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -224,6 +234,9 @@ async function startGateway() {
 
   gatewayProc.on("exit", (code, signal) => {
     console.error(`[gateway] exited code=${code} signal=${signal}`);
+    if (code !== 0 || signal) {
+      lastGatewayError = `Gateway exited code=${code} signal=${signal} at ${new Date().toISOString()}`;
+    }
     gatewayProc = null;
     if (!shuttingDown && isConfigured()) {
       console.log("[gateway] scheduling auto-restart in 2s...");
@@ -275,6 +288,38 @@ async function restartGateway() {
     gatewayProc = null;
   }
   return ensureGatewayRunning();
+}
+
+function redactSecrets(str) {
+  if (!str || typeof str !== "string") return str;
+  return str
+    .replace(/(sk-[A-Za-z0-9]{20,})/g, "***REDACTED***")
+    .replace(/(ghp_[A-Za-z0-9]{36})/g, "***REDACTED***")
+    .replace(/(\d{10}:[A-Za-z0-9_-]{35})/g, "***REDACTED***")
+    .replace(/(xoxb-[A-Za-z0-9-]{50,})/g, "***REDACTED***")
+    .replace(/(xapp-[A-Za-z0-9-]{50,})/g, "***REDACTED***")
+    .replace(/(Bearer\s+)[A-Za-z0-9._-]{20,}/g, "$1***REDACTED***");
+}
+
+async function runBootstrapScript() {
+  const scriptPath = path.join(WORKSPACE_DIR, "bootstrap.sh");
+  try {
+    if (!fs.existsSync(scriptPath)) return;
+    console.log("[bootstrap] found bootstrap.sh, executing...");
+    const result = await Promise.race([
+      runCmd("bash", [scriptPath], { cwd: WORKSPACE_DIR }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("bootstrap.sh timed out after 10 minutes")),
+          600_000,
+        ),
+      ),
+    ]);
+    console.log(`[bootstrap] finished exit=${result.code}`);
+    if (result.output) console.log(result.output);
+  } catch (err) {
+    console.warn(`[bootstrap] failed: ${err.message}`);
+  }
 }
 
 const setupRateLimiter = {
@@ -345,7 +390,13 @@ app.get("/healthz", async (_req, res) => {
   if (isConfigured()) {
     gateway = isGatewayReady() ? "ready" : "starting";
   }
-  res.json({ ok: true, gateway });
+  res.json({
+    ok: true,
+    gateway,
+    lastError: lastGatewayError,
+    configuredAt: getConfiguredAt(),
+    gatewayPid: gatewayProc?.pid ?? null,
+  });
 });
 
 app.get("/setup/healthz", async (_req, res) => {
@@ -833,6 +884,240 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
   });
 });
 
+// ── Backup / Restore ──────────────────────────────────────────────────────────
+
+app.get("/setup/export", requireSetupAuth, (_req, res) => {
+  if (!isConfigured()) {
+    return res.status(400).json({ ok: false, error: "Not configured" });
+  }
+  const stateRel = STATE_DIR.startsWith("/") ? STATE_DIR.slice(1) : STATE_DIR;
+  const wsRel = WORKSPACE_DIR.startsWith("/") ? WORKSPACE_DIR.slice(1) : WORKSPACE_DIR;
+  const dateStr = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="openclaw-backup-${dateStr}.tar.gz"`,
+  );
+  res.setHeader("Content-Type", "application/gzip");
+
+  const proc = childProcess.spawn(
+    "tar",
+    [
+      "-czf", "-",
+      "-C", "/",
+      "--ignore-failed-read",
+      stateRel,
+      wsRel,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+
+  proc.stdout.pipe(res);
+  proc.stderr.on("data", (d) => console.warn(`[export] tar: ${d}`));
+  proc.on("error", (err) => {
+    console.error(`[export] error: ${err.message}`);
+    if (!res.headersSent) res.status(500).end();
+  });
+  proc.on("close", () => res.end());
+});
+
+app.post(
+  "/setup/import",
+  requireSetupAuth,
+  express.raw({ type: () => true, limit: "500mb" }),
+  async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ ok: false, error: "No file data received" });
+    }
+    const tmpPath = path.join(os.tmpdir(), `openclaw-import-${Date.now()}.tar.gz`);
+    try {
+      fs.writeFileSync(tmpPath, req.body);
+
+      // Validate archive — reject if any entry escapes the root
+      const listResult = childProcess.spawnSync("tar", ["-tzf", tmpPath], {
+        encoding: "utf8",
+      });
+      if (listResult.status !== 0) {
+        return res.status(400).json({ ok: false, error: "Invalid tar.gz file" });
+      }
+      const entries = listResult.stdout.split("\n").filter(Boolean);
+      const dangerous = entries.filter(
+        (e) => e.includes("..") || e.startsWith("/"),
+      );
+      if (dangerous.length > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Archive contains unsafe paths",
+        });
+      }
+
+      // Stop gateway
+      if (gatewayProc) {
+        try { gatewayProc.kill("SIGTERM"); } catch {}
+        await sleep(1000);
+        gatewayProc = null;
+      }
+
+      // Extract
+      const extractResult = childProcess.spawnSync(
+        "tar",
+        ["-xzf", tmpPath, "-C", "/"],
+        { encoding: "utf8" },
+      );
+      if (extractResult.status !== 0) {
+        return res.status(500).json({
+          ok: false,
+          error: `Extraction failed: ${extractResult.stderr}`,
+        });
+      }
+
+      // Restart gateway
+      ensureGatewayRunning().catch(() => {});
+      return res.json({
+        ok: true,
+        output: `Extracted ${entries.length} entries. Gateway restarting...`,
+      });
+    } catch (err) {
+      console.error("[import] error:", err);
+      return res.status(500).json({ ok: false, error: String(err) });
+    } finally {
+      try { fs.rmSync(tmpPath, { force: true }); } catch {}
+    }
+  },
+);
+
+// ── Raw Config Editor ─────────────────────────────────────────────────────────
+
+app.get("/setup/api/config/raw", requireSetupAuth, (_req, res) => {
+  if (!isConfigured()) {
+    return res.status(404).json({ ok: false, error: "Not configured" });
+  }
+  try {
+    const content = fs.readFileSync(configPath(), "utf8");
+    return res.json({ ok: true, content });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
+  const { content } = req.body || {};
+  if (typeof content !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing content string" });
+  }
+  try {
+    JSON.parse(content);
+  } catch (err) {
+    return res.status(400).json({ ok: false, error: `Invalid JSON: ${err.message}` });
+  }
+  const cfgPath = configPath();
+  const backupPath = `${cfgPath}.${Date.now()}.bak`;
+  try {
+    if (fs.existsSync(cfgPath)) fs.copyFileSync(cfgPath, backupPath);
+  } catch (err) {
+    console.warn(`[config/raw] backup failed: ${err.message}`);
+  }
+  try {
+    fs.writeFileSync(cfgPath, content, { encoding: "utf8" });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: `Write failed: ${err.message}` });
+  }
+  restartGateway().catch((err) =>
+    console.warn(`[config/raw] gateway restart failed: ${err.message}`),
+  );
+  return res.json({ ok: true, backupPath });
+});
+
+// ── Debug Console ─────────────────────────────────────────────────────────────
+
+const CONSOLE_COMMANDS = [
+  { name: "version", cmd: OPENCLAW_NODE, args: clawArgs(["--version"]) },
+  {
+    name: "gateway:status",
+    cmd: OPENCLAW_NODE,
+    args: clawArgs(["gateway", "status"]),
+  },
+  { name: "gateway:restart", action: "restart" },
+  {
+    name: "doctor",
+    cmd: OPENCLAW_NODE,
+    args: clawArgs(["doctor", "--non-interactive"]),
+  },
+  {
+    name: "plugins:list",
+    cmd: OPENCLAW_NODE,
+    args: clawArgs(["plugins", "list"]),
+  },
+  {
+    name: "devices:list",
+    cmd: OPENCLAW_NODE,
+    args: clawArgs(["devices", "list"]),
+  },
+];
+
+app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
+  const { command } = req.body || {};
+  if (!command || typeof command !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing command" });
+  }
+  const entry = CONSOLE_COMMANDS.find((c) => c.name === command);
+  if (!entry) {
+    return res.status(400).json({
+      ok: false,
+      error: `Unknown command: ${command}. Allowed: ${CONSOLE_COMMANDS.map((c) => c.name).join(", ")}`,
+    });
+  }
+  if (entry.action === "restart") {
+    try {
+      await restartGateway();
+      return res.json({ ok: true, output: "Gateway restarting...", exitCode: 0 });
+    } catch (err) {
+      return res.status(500).json({ ok: false, output: String(err), exitCode: 1 });
+    }
+  }
+  const result = await runCmd(entry.cmd, entry.args);
+  return res.json({
+    ok: result.code === 0,
+    output: redactSecrets(result.output),
+    exitCode: result.code,
+  });
+});
+
+// ── Device Management ─────────────────────────────────────────────────────────
+
+app.get("/setup/api/devices/pending", requireSetupAuth, async (_req, res) => {
+  const result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+  const devices = [];
+  // Try to extract request IDs — format varies by openclaw version
+  const idPattern = /([a-zA-Z0-9]{8,})\s+(?:pending|waiting|requested)/gi;
+  let match;
+  while ((match = idPattern.exec(result.output)) !== null) {
+    devices.push({ id: match[1], raw: match[0].trim() });
+  }
+  return res.json({
+    ok: result.code === 0,
+    devices,
+    rawOutput: redactSecrets(result.output),
+  });
+});
+
+app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
+  const { requestId } = req.body || {};
+  if (!requestId || typeof requestId !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing requestId" });
+  }
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(requestId)) {
+    return res.status(400).json({ ok: false, error: "Invalid requestId format" });
+  }
+  const result = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["devices", "approve", requestId]),
+  );
+  return res.status(result.code === 0 ? 200 : 500).json({
+    ok: result.code === 0,
+    output: redactSecrets(result.output),
+  });
+});
+
 app.get("/tui", requireSetupAuth, (_req, res) => {
   if (!ENABLE_WEB_TUI) {
     return res
@@ -1068,6 +1353,7 @@ const server = app.listen(PORT, () => {
       } catch (err) {
         console.warn(`[wrapper] doctor --fix failed: ${err.message}`);
       }
+      await runBootstrapScript();
       await ensureGatewayRunning();
     })().catch((err) => {
       console.error(`[wrapper] failed to start gateway at boot: ${err.message}`);

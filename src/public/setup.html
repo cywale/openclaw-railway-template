@@ -41,6 +41,24 @@
       isReady: false,
       tuiEnabled: false,
 
+      // Backup/Restore
+      importFile: null,
+
+      // Config Editor
+      showConfigModal: false,
+      configContent: '',
+      configSaving: false,
+
+      // Debug Console
+      consoleCommand: 'version',
+      consoleOutput: '',
+      consoleLoading: false,
+
+      // Device Management
+      showDeviceModal: false,
+      pendingDevices: [],
+      devicesFetching: false,
+
       get currentGroup() {
         return this.authGroups.find(g => g.value === this.selectedGroup);
       },
@@ -218,6 +236,128 @@
         } finally {
           this.loading = false;
         }
+      },
+
+      // Backup/Restore
+      exportBackup() {
+        window.location.href = '/setup/export';
+      },
+
+      async importBackup() {
+        if (!this.importFile) { alert('Select a backup file first'); return; }
+        if (!confirm('Import backup? This will overwrite existing data and restart the gateway.')) return;
+        this.log = 'Importing backup...\n';
+        this.loading = true;
+        try {
+          const res = await fetch('/setup/import', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: this.importFile,
+          });
+          const j = await res.json();
+          this.log += j.ok ? ('✓ ' + j.output + '\n') : ('✗ Error: ' + j.error + '\n');
+          if (j.ok) await this.refreshStatus();
+        } catch (e) {
+          this.log += 'Error: ' + String(e) + '\n';
+        } finally {
+          this.loading = false;
+        }
+      },
+
+      // Config Editor
+      async openConfigEditor() {
+        this.configContent = 'Loading...';
+        this.showConfigModal = true;
+        try {
+          const j = await this.httpJson('/setup/api/config/raw');
+          this.configContent = j.content || '';
+        } catch (e) {
+          this.configContent = 'Error loading config: ' + String(e);
+        }
+      },
+
+      async saveConfig() {
+        this.configSaving = true;
+        try {
+          await this.httpJson('/setup/api/config/raw', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ content: this.configContent }),
+          });
+          this.showConfigModal = false;
+          this.log += '✓ Config saved. Gateway restarting...\n';
+        } catch (e) {
+          alert('Failed to save config: ' + String(e));
+        } finally {
+          this.configSaving = false;
+        }
+      },
+
+      // Debug Console
+      async runConsoleCommand() {
+        if (!this.consoleCommand) return;
+        this.consoleOutput = 'Running...\n';
+        this.consoleLoading = true;
+        try {
+          const res = await fetch('/setup/api/console/run', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ command: this.consoleCommand }),
+          });
+          const j = await res.json();
+          this.consoleOutput = j.output || (j.ok ? '(no output)' : (j.error || 'Unknown error'));
+        } catch (e) {
+          this.consoleOutput = 'Error: ' + String(e);
+        } finally {
+          this.consoleLoading = false;
+        }
+      },
+
+      // Device Management
+      openDeviceModal() {
+        this.pendingDevices = [];
+        this.showDeviceModal = true;
+      },
+
+      async fetchPendingDevices() {
+        this.devicesFetching = true;
+        try {
+          const j = await this.httpJson('/setup/api/devices/pending');
+          this.pendingDevices = j.devices || [];
+          if (this.pendingDevices.length === 0) {
+            this.log += '\n[devices list]\n' + (j.rawOutput || 'No pending device requests.\n');
+          }
+        } catch (e) {
+          this.log += 'Error fetching devices: ' + String(e) + '\n';
+        } finally {
+          this.devicesFetching = false;
+        }
+      },
+
+      async approveDevice(requestId) {
+        this.showDeviceModal = false;
+        this.log += '\nApproving device ' + requestId + '...\n';
+        try {
+          const res = await fetch('/setup/api/devices/approve', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ requestId }),
+          });
+          const j = await res.json();
+          if (j.ok) {
+            this.log += '✓ Device approved\n' + (j.output || '');
+            alert('✓ Device approved');
+          } else {
+            this.log += '✗ Failed: ' + (j.output || j.error || '') + '\n';
+            alert('✗ Approval failed: ' + (j.output || j.error || ''));
+          }
+        } catch (e) {
+          this.log += '✗ Error: ' + String(e) + '\n';
+          alert('✗ Error: ' + String(e));
+        }
       }
     }));
   });
@@ -260,7 +400,8 @@
         <h2 class="text-lg font-semibold mb-1">Setup Complete</h2>
         <p class="text-neutral-500 text-sm mb-6">Your OpenClaw instance is configured and running</p>
 
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-4">
+          <!-- Run Doctor -->
           <div class="flex flex-col bg-amber-50 dark:bg-amber-900/20 rounded-xl p-4 border border-amber-200 dark:border-amber-800">
             <div class="flex items-center gap-3 mb-3">
               <div class="w-10 h-10 bg-amber-500/20 rounded-lg flex items-center justify-center">
@@ -278,6 +419,7 @@
             </button>
           </div>
 
+          <!-- Approve Channel Pairing -->
           <div class="flex flex-col bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 border border-blue-200 dark:border-blue-800">
             <div class="flex items-center gap-3 mb-3">
               <div class="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
@@ -291,6 +433,56 @@
             </button>
           </div>
 
+          <!-- Approve Device -->
+          <div class="flex flex-col bg-violet-50 dark:bg-violet-900/20 rounded-xl p-4 border border-violet-200 dark:border-violet-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-violet-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-violet-600 dark:text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+              </div>
+              <span class="font-medium text-violet-700 dark:text-violet-300">Approve Device</span>
+            </div>
+            <p class="text-sm text-violet-600/80 dark:text-violet-400/70 flex-1">Approve device pairing requests that show "disconnected (1008): pairing required".</p>
+            <button @click="openDeviceModal()" :disabled="loading" class="w-full mt-4 bg-violet-100 dark:bg-violet-900/40 hover:bg-violet-200 dark:hover:bg-violet-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-violet-700 dark:text-violet-300 px-4 py-2.5 rounded-lg font-medium border border-violet-300 dark:border-violet-700 transition-colors">
+              Manage Devices
+            </button>
+          </div>
+
+          <!-- Backup & Restore -->
+          <div class="flex flex-col bg-teal-50 dark:bg-teal-900/20 rounded-xl p-4 border border-teal-200 dark:border-teal-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-teal-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-teal-600 dark:text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"/></svg>
+              </div>
+              <span class="font-medium text-teal-700 dark:text-teal-300">Backup & Restore</span>
+            </div>
+            <p class="text-sm text-teal-600/80 dark:text-teal-400/70 flex-1 mb-3">Export your config and workspace to a tar.gz, or restore from a previous backup.</p>
+            <button @click="exportBackup()" class="w-full bg-teal-100 dark:bg-teal-900/40 hover:bg-teal-200 dark:hover:bg-teal-900/60 text-teal-700 dark:text-teal-300 px-4 py-2 rounded-lg font-medium border border-teal-300 dark:border-teal-700 transition-colors text-sm mb-2">
+              Export Backup
+            </button>
+            <label class="w-full cursor-pointer">
+              <span class="block w-full bg-teal-50 dark:bg-teal-900/20 hover:bg-teal-100 dark:hover:bg-teal-900/40 text-teal-600 dark:text-teal-400 px-4 py-2 rounded-lg font-medium border border-teal-200 dark:border-teal-800 transition-colors text-sm text-center" x-text="importFile ? importFile.name : 'Choose Backup File'"></span>
+              <input type="file" accept=".tar.gz,.tgz" class="hidden" @change="importFile = $event.target.files[0]" />
+            </label>
+            <button @click="importBackup()" :disabled="loading || !importFile" class="w-full mt-2 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg font-medium transition-colors text-sm">
+              Import Backup
+            </button>
+          </div>
+
+          <!-- Edit Config -->
+          <div class="flex flex-col bg-orange-50 dark:bg-orange-900/20 rounded-xl p-4 border border-orange-200 dark:border-orange-800">
+            <div class="flex items-center gap-3 mb-3">
+              <div class="w-10 h-10 bg-orange-500/20 rounded-lg flex items-center justify-center">
+                <svg class="w-5 h-5 text-orange-600 dark:text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+              </div>
+              <span class="font-medium text-orange-700 dark:text-orange-300">Edit Config</span>
+            </div>
+            <p class="text-sm text-orange-600/80 dark:text-orange-400/70 flex-1">Directly edit openclaw.json. A timestamped backup is created automatically before saving.</p>
+            <button @click="openConfigEditor()" :disabled="loading" class="w-full mt-4 bg-orange-100 dark:bg-orange-900/40 hover:bg-orange-200 dark:hover:bg-orange-900/60 disabled:opacity-50 disabled:cursor-not-allowed text-orange-700 dark:text-orange-300 px-4 py-2.5 rounded-lg font-medium border border-orange-300 dark:border-orange-700 transition-colors">
+              Edit Config
+            </button>
+          </div>
+
+          <!-- Reset Setup -->
           <div class="flex flex-col bg-red-50 dark:bg-red-900/20 rounded-xl p-4 border border-red-200 dark:border-red-800">
             <div class="flex items-center gap-3 mb-3">
               <div class="w-10 h-10 bg-red-500/20 rounded-lg flex items-center justify-center">
@@ -303,6 +495,27 @@
               Reset Setup
             </button>
           </div>
+        </div>
+
+        <!-- Debug Console -->
+        <div class="bg-neutral-50 dark:bg-neutral-800/50 rounded-xl p-4 border border-neutral-200 dark:border-neutral-700 mb-4">
+          <h3 class="text-sm font-medium text-neutral-600 dark:text-neutral-400 mb-3">Debug Console</h3>
+          <div class="flex gap-2 mb-3">
+            <select x-model="consoleCommand" class="flex-1 bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-red-500 transition-colors">
+              <option value="version">version</option>
+              <option value="gateway:status">gateway:status</option>
+              <option value="gateway:restart">gateway:restart</option>
+              <option value="doctor">doctor</option>
+              <option value="plugins:list">plugins:list</option>
+              <option value="devices:list">devices:list</option>
+            </select>
+            <button @click="runConsoleCommand()" :disabled="consoleLoading" class="bg-neutral-800 dark:bg-neutral-700 hover:bg-neutral-700 dark:hover:bg-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2">
+              <svg x-show="consoleLoading" class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+              <span x-show="!consoleLoading">Run</span>
+              <span x-show="consoleLoading">Running...</span>
+            </button>
+          </div>
+          <pre x-show="consoleOutput" x-text="consoleOutput" class="bg-neutral-900 dark:bg-neutral-950 text-green-400 text-xs rounded-lg p-3 whitespace-pre-wrap max-h-48 overflow-y-auto font-mono"></pre>
         </div>
 
         <div x-show="log" class="bg-neutral-100 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-lg p-4 font-mono text-xs text-neutral-600 dark:text-neutral-400 whitespace-pre-wrap max-h-64 overflow-y-auto" x-text="log"></div>
@@ -487,6 +700,51 @@
           Next
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
         </button>
+      </div>
+    </div>
+
+    <!-- Config Editor Modal -->
+    <div x-show="showConfigModal" x-cloak class="fixed inset-0 bg-black/50 dark:bg-black/70 flex items-center justify-center z-50 p-4" @click.self="showConfigModal = false">
+      <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl p-6 w-full max-w-2xl shadow-xl dark:shadow-none flex flex-col max-h-[85vh]">
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="text-lg font-semibold">Edit Configuration</h3>
+          <span class="text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/30 px-2 py-1 rounded">Saves will restart the gateway</span>
+        </div>
+        <textarea
+          x-model="configContent"
+          class="flex-1 min-h-64 bg-neutral-50 dark:bg-neutral-950 border border-neutral-300 dark:border-neutral-700 rounded-lg px-4 py-3 text-sm font-mono focus:outline-none focus:border-orange-500 transition-colors resize-none overflow-y-auto"
+          spellcheck="false"
+          placeholder="Loading..."
+        ></textarea>
+        <div class="flex gap-3 mt-4">
+          <button @click="saveConfig()" :disabled="configSaving" class="flex-1 bg-orange-600 hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-3 rounded-lg font-medium transition-colors flex items-center justify-center gap-2">
+            <svg x-show="configSaving" class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+            <span x-text="configSaving ? 'Saving...' : 'Save & Restart Gateway'"></span>
+          </button>
+          <button @click="showConfigModal = false" class="flex-1 bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 px-4 py-3 rounded-lg font-medium border border-neutral-300 dark:border-neutral-700 transition-colors">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Device Management Modal -->
+    <div x-show="showDeviceModal" x-cloak class="fixed inset-0 bg-black/50 dark:bg-black/70 flex items-center justify-center z-50" @click.self="showDeviceModal = false">
+      <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl p-6 w-full max-w-md mx-4 shadow-xl dark:shadow-none">
+        <h3 class="text-lg font-semibold mb-2">Device Management</h3>
+        <p class="text-sm text-neutral-500 dark:text-neutral-400 mb-4">Approve devices that show "pairing required" errors.</p>
+        <button @click="fetchPendingDevices()" :disabled="devicesFetching" class="w-full mb-4 bg-violet-100 dark:bg-violet-900/40 hover:bg-violet-200 dark:hover:bg-violet-900/60 disabled:opacity-50 text-violet-700 dark:text-violet-300 px-4 py-2.5 rounded-lg font-medium border border-violet-300 dark:border-violet-700 transition-colors flex items-center justify-center gap-2">
+          <svg x-show="devicesFetching" class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+          <span x-text="devicesFetching ? 'Fetching...' : 'Fetch Pending Devices'"></span>
+        </button>
+        <div x-show="pendingDevices.length > 0" class="space-y-2 mb-4">
+          <template x-for="device in pendingDevices" :key="device.id">
+            <div class="flex items-center justify-between bg-violet-50 dark:bg-violet-900/20 rounded-lg px-3 py-2 border border-violet-200 dark:border-violet-800">
+              <span class="text-sm font-mono text-violet-700 dark:text-violet-300" x-text="device.id"></span>
+              <button @click="approveDevice(device.id)" class="text-xs bg-violet-600 hover:bg-violet-700 text-white px-3 py-1 rounded-lg font-medium transition-colors">Approve</button>
+            </div>
+          </template>
+        </div>
+        <p x-show="pendingDevices.length === 0 && !devicesFetching" class="text-sm text-neutral-500 dark:text-neutral-400 text-center py-2 mb-4">Fetch devices to see pending requests, or check the console log.</p>
+        <button @click="showDeviceModal = false" class="w-full bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 px-4 py-3 rounded-lg font-medium border border-neutral-300 dark:border-neutral-700 transition-colors">Close</button>
       </div>
     </div>
 
